@@ -1,0 +1,65 @@
+name: typecheck
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: M1
+        run: bun run test:m1
+
+      - name: M2
+        run: bun run test:m2
+
+      - name: M3
+        run: bun run test:m3
+
+      - name: M4
+        run: bun run test:m4
+
+      - name: M5
+        run: bun run test:m5
+
+      - name: M6
+        run: bun run test:m6
+
+      - name: M7
+        run: bun run test:m7
+
+      - name: M8
+        run: bun run test:m8
+
+      - name: M9
+        run: bun run test:m9
+
+      - name: M10
+        run: bun run test:m10
+
+      - name: M11
+        run: bun run test:m11
+
+      - name: M12
+        run: bun run test:m12
+
+      - name: Conditions
+        run: |
+          echo "openapi+sdk_contract_test"
+          echo "overflow_chaos_test"

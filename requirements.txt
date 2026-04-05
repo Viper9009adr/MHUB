@@ -1,0 +1,10 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+grpcio>=1.57.0
+grpcio-tools>=1.57.0
+pydantic>=2.0.0
+asyncpg>=0.28.0
+redis>=5.0.0
+msgpack>=1.0.0
+textual>=2.0.0
+mcp>=1.0.0
