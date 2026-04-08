@@ -245,36 +245,25 @@ Get the current state of a hub.
 
 **Error**: `NOT_FOUND` when hub does not exist.
 
-### TUI — Phase 1 (AGENTIC-CLI-TUI-FIX)
+### TUI — current implemented layout and flow
 
-The Python TUI in `src/agentic_cli/tui.py` was updated by IMP to replace the
-previous vertical single-panel layout with a 3-panel horizontal layout and
-streaming LLM response display.
+The Python TUI in `src/agentic_cli/tui.py` currently uses `MeridianApp` with
+`OrcChatScreen` as the main chat surface.
 
-**Layout changes:**
-- `Screen { layout: horizontal }` — the root screen now uses a horizontal flow
-- Left panel (`#left-panel`, width 20) — reserved for future navigation
-- Center panel (`#center-panel`, 1fr) — hosts the `MessageLog` (RichLog) and `LoadingIndicator`
-- Right panel (`#right-panel`, width 20) — reserved for future context display
-- Bottom bar (`#bottom-bar`, docked) — contains the prompt `Input` and a `Label` showing approximate token count
+**Current chat layout (`OrcChatScreen.compose`):**
+- `#chat-shell` vertical container
+- `#center-panel` with `MessageLog` (`TextArea`, read-only) and `LoadingIndicator`
+- `#prompt-row` with `Input(id="prompt-input")`
+- `StatusBar(id="status-bar")` docked at the bottom
 
-**Streaming:**
-- When `LLM_PROVIDER` is set (and not `"local"`), `MeridianTUI` calls
-  `AgenticCliService.async_stream_with_llm` and collects chunks via an async
-  `for` loop. The `LoadingIndicator` is shown during the stream and hidden
-  when the stream completes or raises.
-- When no LLM provider is configured, the synchronous `AgenticCliService.run`
-  path is used unchanged.
+There are no `#left-panel`, `#right-panel`, `#bottom-bar`, `#chat-header`,
+`#chat-footer`, or `#token-label` widgets in the current `OrcChatScreen`.
 
-**Service additions (service.py):**
-- `async_stream_with_llm(command, llm_provider, llm_model)` — async generator
-  that yields `str` fragments from `llm_provider.stream()`. Retries up to 3
-  times on `LLMRateLimitError` or `LLMTimeoutError` with a 1-second backoff.
-  After a successful stream, writes `session_id` and `turn_index` to
-  `_last_session_id` and `_last_turn_index` on the service instance.
-- `_last_session_id` and `_last_turn_index` — instance attributes set after
-  each successful `async_stream_with_llm` call so the TUI can recover session
-  continuity without a `RunReceipt`.
+**Current run paths (`OrcChatScreen._run_command`):**
+- If `_hub_id` exists: stream via `GrpcHubClient.stream_prompt(...)`
+- Else if `_llm_provider` exists: run the ORC→ARC→CRT→IMP LLM pipeline in
+  `_run_agent_pipeline(...)`
+- Else: use synchronous local `AgenticCliService.run(...)`
 
 **Runtime dependencies added:**
 - `python-dotenv>=1.0.0` — loaded at TUI startup to populate `.env` variables
@@ -289,7 +278,7 @@ per-run outbound queue management.
 #### New module: `src/agentic_cli/grpc_client.py`
 
 `GrpcHubClient` is an async gRPC client wrapping `HubServiceStub` for TUI
-use.  It is instantiated once in `MeridianTUI.__init__` and reuses a single
+use. It is instantiated in `OrcChatScreen.__init__` and reuses a single
 `grpc.aio` channel for all calls.
 
 | Method | Description |
@@ -333,15 +322,12 @@ without a separate metadata field.
 calls `llm_provider.stream(prompt_text)`, and yields each chunk as an
 `AgentMessage`.  Without a provider, payloads are echoed verbatim.
 
-#### TUI left panel — live hub status polling
+#### TUI hub initialization
 
-`on_mount` (now `async def`) performs two actions after the welcome messages:
-
-1. Calls `_init_hub()` — attempts `create_hub(workspace_id="cli", initiator="tui")`;
-   writes the short hub_id or `"offline"` to `RichLog(id="hub-status-log")`.
-2. Registers a 2-second interval timer via `set_interval(2.0, _poll_hub_status)`.
-   Each tick calls `hub_status(hub_id)` and appends the state string to the
-   same left panel log.
+`OrcChatScreen.on_mount()` calls `_init_hub()`, which attempts
+`create_hub(workspace_id="cli", initiator="tui")` once and stores `_hub_id`.
+If hub creation fails, the TUI logs a warning and continues with non-gRPC
+fallback behavior.
 
 #### _run_command three-branch logic
 
@@ -349,7 +335,7 @@ calls `llm_provider.stream(prompt_text)`, and yields each chunk as an
 if self._hub_id is not None:
     # gRPC AgentStream path (stream_prompt)
 elif self._llm_provider is not None:
-    # Local LLM fallback (async_stream_with_llm)
+    # Local LLM pipeline (_run_agent_pipeline)
 else:
     # Sync echo (service.run)
 ```
@@ -386,7 +372,7 @@ This batch implements three TUI behavior fixes by **IMP** and is validated by
 
 #### 1) Session continuity keeps non-blank ID on follow-up prompts
 
-`MeridianTUI._resolve_session_id()` now treats blank and whitespace-only
+`OrcChatScreen._resolve_session_id()` now treats blank and whitespace-only
 candidates as non-authoritative. If a non-blank session is already active, it
 is preserved instead of being replaced by an empty value. When no session has
 been established yet, the TUI derives a deterministic UUID5 fallback from hub
@@ -399,8 +385,8 @@ Validated by:
 
 #### 2) HUB status panel deduplicates rows and updates in place
 
-Hub states are tracked by `hub_id` in `MeridianTUI._hub_rows` and rendered via
-`_render_hub_rows()`. Poll updates call `_apply_hub_state(...)`, which drops
+Hub states are tracked by `hub_id` in `OrcChatScreen._hub_rows` and rendered via
+`_build_hub_rows()`. Poll updates call `_apply_hub_state(...)`, which drops
 stale poll results by sequence number and overwrites the existing state for the
 same hub key instead of appending duplicate lines.
 
@@ -419,6 +405,56 @@ If clipboard access is unavailable, the selected text is retained in
 Validated by:
 
 - `test_center_pane_textarea_is_selectable_and_copy_paths_work`
+
+### AGENTIC-CLI-PROTOBUF Phase 6 — hub event bus continuity and intent routing
+
+This update was implemented by **IMP** and validated by **TST** in
+`tests/unit/test_tui.py` and `tests/unit/test_orc_dispatch.py`.
+
+#### 1) App-level ORC event listener persists across screen navigation
+
+`MeridianApp` now owns a single long-lived ORC event listener task
+(`_orc_event_listener_task`) and starts it once in `on_mount()` via
+`_start_orc_event_listener()`. Repeated HUB view navigation no longer creates
+duplicate listeners.
+
+Validated by:
+
+- `test_meridian_app_listener_is_singleton_across_navigation`
+
+#### 2) Hub event queue now handles overflow by dropping oldest entries
+
+Hub frames are written through `_enqueue_hub_event_with_drop_oldest(...)` on a
+bounded app queue. When full, the oldest frame is removed before the new frame
+is enqueued, preserving most-recent event visibility under burst traffic.
+
+Validated by:
+
+- `test_hub_event_queue_drops_oldest_preserving_fifo_order`
+
+#### 3) HUB view replay keeps latest 50 rendered lines
+
+`HubViewScreen` tracks rendered lines in a local `deque(maxlen=50)` and exposes
+FIFO replay via `_replay_lines()`. This keeps a bounded local history for the
+active view lifecycle.
+
+Validated by:
+
+- `test_hub_view_replay_ring_keeps_latest_fifty_in_order`
+
+#### 4) Deterministic pre-LLM hub intent matching expanded
+
+`resolve_pre_llm_hub_intent()` in `src/orc/dispatch.py` now includes expanded
+exact aliases and phrase-level hub-context matching for `status`, `report`, and
+`location` intents, with deterministic precedence (`status > report >
+location`) when multiple keywords appear.
+
+Validated by:
+
+- `test_exact_match_beats_phrase_match`
+- `test_phrase_match_maps_status_report_on_hub`
+- `test_phrase_match_without_hub_returns_none`
+- `test_unknown_prompt_returns_none`
 
 ### AGENTIC-CLI-PROTOBUF — LLM stream retry and model plumbing fixes
 
@@ -709,3 +745,49 @@ make lint-ts
 **Phase E** — TUI: `reconstructed/tsconfig.tui.json`, `reconstructed/vite.config.ts`, `reconstructed/eslint.config.js`, `reconstructed/src/bridge/types.ts` (extended), `reconstructed/src/bridge/http_client.ts`, `reconstructed/src/components/meridian/*.tsx`
 
 **Phase F** — Hardening: `.env.example`, `Makefile`, `scripts/dev.sh`, `docs/llm-providers.md`, `README.md` (extended)
+
+### MCP Tooling
+
+The agentic runtime includes MCP (Model Context Protocol) integration for external tool discovery and invocation.
+
+#### MCPManager
+
+`MCPManager` (in `src/agentic/mcp_manager.py`) manages connections to MCP servers via SSE transport:
+
+- **Config Loading:** Reads `.mcp.json` from project root or configurable path
+- **Tool Discovery:** Returns tools in LLM-compatible format (`{"type": "function", "function": {...}}`)
+- **Tool Invocation:** Calls tools via `session.call_tool(name, arguments)`
+- **Retry Logic:** 3 retries with 1s delay on connection failures
+
+#### Configuration
+
+Create `.mcp.json` in the project root:
+
+```json
+{
+  "mcpServers": {
+    "server-name": {
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
+```
+
+#### Usage
+
+```python
+from src.agentic.mcp_manager import MCPManager
+
+manager = MCPManager()
+await manager.initialize()
+
+# Discover tools
+tools = await manager.discover_tools()
+
+# Invoke a tool
+result = await manager.invoke_tool("tool_name", {"param": "value"})
+
+await manager.shutdown()
+```
+
+See `docs/mcp-integration.md` for full API reference and examples.

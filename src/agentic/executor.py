@@ -52,47 +52,47 @@ class AgentExecutor:
         self._tool_handlers[tool_name] = handler
         logger.debug("Registered handler for tool: %s", tool_name)
 
-	async def execute_tool(
-		self,
-		request: ToolCallRequest,
-		timeout_ms: int = 30000,
-	) -> ToolCallResult:
-		"""Execute a tool call request.
+    async def execute_tool(
+        self,
+        request: ToolCallRequest,
+        timeout_ms: int = 30000,
+    ) -> ToolCallResult:
+        """Execute a tool call request.
 
-		Args:
-			request: The tool call request to execute.
-			timeout_ms: Maximum execution time.
+        Args:
+            request: The tool call request to execute.
+            timeout_ms: Maximum execution time.
 
-		Returns:
-			Result of the tool execution.
-		"""
-		# Validate request schema
-		if not request.call_id or not isinstance(request.call_id, str):
-			return ToolCallResult(
-				call_id=request.call_id or "",
-				success=False,
-				error="Invalid call_id in request",
-				execution_ms=0,
-			)
-		if not request.tool_name or not isinstance(request.tool_name, str):
-			return ToolCallResult(
-				call_id=request.call_id,
-				success=False,
-				error="Invalid tool_name in request",
-				execution_ms=0,
-			)
-		if request.parameters is None:
-			request.parameters = {}
-		if not isinstance(request.parameters, dict):
-			return ToolCallResult(
-				call_id=request.call_id,
-				success=False,
-				error="parameters must be a dict",
-				execution_ms=0,
-			)
+        Returns:
+            Result of the tool execution.
+        """
+        # Validate request schema
+        if not request.call_id or not isinstance(request.call_id, str):
+            return ToolCallResult(
+                call_id=request.call_id or "",
+                success=False,
+                error="Invalid call_id in request",
+                execution_ms=0,
+            )
+        if not request.tool_name or not isinstance(request.tool_name, str):
+            return ToolCallResult(
+                call_id=request.call_id,
+                success=False,
+                error="Invalid tool_name in request",
+                execution_ms=0,
+            )
+        if request.parameters is None:
+            request.parameters = {}
+        if not isinstance(request.parameters, dict):
+            return ToolCallResult(
+                call_id=request.call_id,
+                success=False,
+                error="parameters must be a dict",
+                execution_ms=0,
+            )
 
-		start_time = time.time()
-		call_id = request.call_id
+        start_time = time.time()
+        call_id = request.call_id
 
         # Check policy
         allowed = await self._policy.check(
@@ -147,7 +147,7 @@ class AgentExecutor:
             )
         except Exception as exc:
             execution_ms = int((time.time() - start_time) * 1000)
-            logger.error(
+            logger.exception(
                 "Tool %s failed: %s",
                 request.tool_name,
                 exc,
@@ -221,7 +221,7 @@ class AgentExecutor:
         except Exception as exc:
             result["success"] = False
             result["error"] = str(exc)
-            logger.error(
+            logger.exception(
                 "Turn execution failed for agent %s: %s",
                 context.agent_id,
                 exc,

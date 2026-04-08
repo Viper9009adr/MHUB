@@ -40,6 +40,7 @@ class GrpcHubClient:
         self._address = address
         self._channel: grpc.aio.Channel | None = None
         self._stub: HubServiceStub | None = None
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -55,6 +56,7 @@ class GrpcHubClient:
 
     async def close(self) -> None:
         """Close the gRPC channel."""
+        self._closed = True
         if self._channel is not None:
             await self._channel.close()
             self._channel = None
@@ -127,10 +129,10 @@ class GrpcHubClient:
                 if response.err:
                     logger.error("stream_prompt error: %s", response.err)
                     break
-                if response.payload:
-                    yield response.payload.decode("utf-8", errors="replace")
                 if response.done:
                     break
+                if response.payload:
+                    yield response.payload.decode("utf-8", errors="replace")
         except grpc.aio.AioRpcError as exc:
             logger.error("stream_prompt gRPC error: %s", exc)
             raise
@@ -152,6 +154,43 @@ class GrpcHubClient:
         except grpc.aio.AioRpcError as exc:
             logger.warning("hub_status gRPC error: %s", exc)
             return "unknown"
+
+    async def listen_orc_events(self) -> "AsyncIterator[tuple[str, str, str]]":
+        """Subscribe to OrchestratorEvents RPC and yield (type, status, payload) tuples.
+
+        Opens a bidirectional OrchestratorEvents stream, sends an initial
+        subscribe frame, then yields decoded frames until the stream closes or
+        an error occurs.
+
+        Yields:
+            (type_str, status_str, payload_str) for each incoming frame.
+            On AioRpcError yields ("ERR", "", str(e)) then returns.
+        """
+        from src.hub.hub_pb2 import OrchEvent
+
+        stub = self._ensure_channel()
+        stop = asyncio.Event()
+
+        async def _subscribe_gen() -> "AsyncIterator[OrchEvent]":
+            yield OrchEvent(type="subscribe", payload=b"cli-hub-view")
+            await stop.wait()
+
+        try:
+            async for event in stub.OrchestratorEvents(_subscribe_gen()):
+                if self._closed:
+                    return
+                type_str = event.type or ""
+                status_str = event.status or ""
+                payload_str = event.payload.decode("utf-8", errors="replace") if event.payload else ""
+                yield (type_str, status_str, payload_str)
+        except grpc.aio.AioRpcError as exc:
+            if self._closed:
+                return
+            logger.warning("listen_orc_events gRPC error: %s", exc)
+            yield ("ERR", "", str(exc))
+            return
+        finally:
+            stop.set()
 
 
 __all__ = ["GrpcHubClient"]

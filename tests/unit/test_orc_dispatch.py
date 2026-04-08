@@ -7,7 +7,7 @@ import pytest
 
 from src.agentic_cli.contracts import RunCommand, RunReceipt
 from src.agentic_cli.service import AgenticCliService
-from src.orc.dispatch import OrcDispatch, OrcDispatchError
+from src.orc.dispatch import OrcDispatch, OrcDispatchError, resolve_pre_llm_hub_intent
 from src.orc.task_queue import TaskItem, TaskQueue
 
 
@@ -70,3 +70,17 @@ class TestOrcDispatch:
     def test_queue_property(self) -> None:
         dispatch = OrcDispatch()
         assert isinstance(dispatch.queue, TaskQueue)
+
+
+class TestResolvePreLlmHubIntent:
+    def test_exact_match_beats_phrase_match(self) -> None:
+        assert resolve_pre_llm_hub_intent("/hub report") == "report"
+
+    def test_phrase_match_maps_status_report_on_hub(self) -> None:
+        assert resolve_pre_llm_hub_intent("status report on hub") == "status"
+
+    def test_phrase_match_without_hub_returns_none(self) -> None:
+        assert resolve_pre_llm_hub_intent("status report for sprint") is None
+
+    def test_unknown_prompt_returns_none(self) -> None:
+        assert resolve_pre_llm_hub_intent("tell me a joke") is None

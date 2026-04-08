@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import grpc
@@ -40,8 +40,50 @@ from src.hub.hub_pb2_grpc import HubServiceServicer
 from src.hub.stream_router import StreamRouter
 from src.storage.models import HubRecord, CheckpointRecord, ForkScenarioRecord
 from src.orc.fork_handler import ForkHandler, DivergenceEvent
+from src.orc.dispatch import resolve_pre_llm_hub_intent
 
 logger = logging.getLogger(__name__)
+
+ORC_PROMPT = (
+    "You are ORC. Restate the user task in 1-2 sentences and define the final answer shape."
+)
+ARC_PROMPT = (
+    "You are ARC. Produce a concise execution plan in 3-5 bullets for the task."
+)
+CRT_PROMPT = (
+    "You are CRT. Review ARC's plan with ORC context. Reply with APPROVED or "
+    "REJECTED: <reason>, then one short rationale."
+)
+
+
+class OrchEventBus:
+    """In-process async pub/sub bus for OrchEvent frames."""
+
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue[OrchEvent]] = set()
+
+    async def publish(self, event: OrchEvent) -> None:
+        """Publish an event to all active subscribers."""
+        if not self._subscribers:
+            return
+        stale: list[asyncio.Queue[OrchEvent]] = []
+        for queue in self._subscribers:
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                stale.append(queue)
+        for queue in stale:
+            self._subscribers.discard(queue)
+
+    def subscribe(self) -> asyncio.Queue[OrchEvent]:
+        """Create and register a subscriber queue."""
+        queue: asyncio.Queue[OrchEvent] = asyncio.Queue()
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[OrchEvent]) -> None:
+        """Remove a subscriber queue."""
+        self._subscribers.discard(queue)
 
 
 class HubService(HubServiceServicer):
@@ -65,6 +107,7 @@ class HubService(HubServiceServicer):
         fork_handler: ForkHandler | None = None,
         llm_provider: Any = None,
         llm_model: str = "",
+        orch_event_bus: OrchEventBus | None = None,
     ) -> None:
         """Initialise HubService.
 
@@ -82,6 +125,7 @@ class HubService(HubServiceServicer):
         self._fork_handler = fork_handler
         self._llm_provider = llm_provider
         self._llm_model = llm_model
+        self._orch_event_bus = orch_event_bus or OrchEventBus()
         self._stream_router = StreamRouter()
         self._hubs: dict[str, dict[str, Any]] = {}
         self._events: dict[str, list[JoinHubEvent]] = defaultdict(list)
@@ -147,9 +191,171 @@ class HubService(HubServiceServicer):
             except Exception as e:
                 logger.error("storage op failed: %s", e)
 
+    def _decode_hub_agent(self, agent_id: str) -> tuple[str, str]:
+        """Decode `hub:<hub_id>:...:<agent_name>` style agent_id."""
+        if not agent_id.startswith("hub:"):
+            return "", ""
+        parts = agent_id.split(":", 3)
+        hub_id = parts[1] if len(parts) > 1 else ""
+        agent_name = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
+        return hub_id, agent_name
+
+    def _hub_meta_intent(self, prompt_text: str) -> str | None:
+        """Return hub meta intent for deny-default bypass routing."""
+        return resolve_pre_llm_hub_intent(prompt_text)
+
+    async def _resolve_hub_status_for_stream(self, hub_id: str) -> HubStatusResponse | None:
+        """Resolve hub status without mutating stream RPC context status."""
+        if not hub_id:
+            return None
+        if self._has_storage():
+            hub_record = await self._storage.get_hub(hub_id)
+            if hub_record is None:
+                return None
+            return HubStatusResponse(
+                hub_id=hub_id,
+                state=hub_record.state,
+                updated_at=hub_record.created_at,
+            )
+        hub = self._hubs.get(hub_id)
+        if hub is None:
+            return None
+        return HubStatusResponse(
+            hub_id=hub_id,
+            state=hub["state"],
+            updated_at=hub["created_at"],
+        )
+
+    def _render_hub_meta_payload(self, intent: str, status: HubStatusResponse) -> bytes:
+        """Render deterministic payload for hub-state/report/location intents."""
+        if intent == "location":
+            return status.hub_id.encode("utf-8")
+        return json.dumps(
+            {
+                "id": status.hub_id,
+                "current": status.state,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
     # ------------------------------------------------------------------
     # RPCs
     # ------------------------------------------------------------------
+
+    async def _publish_orch_event(
+        self,
+        run_id: int,
+        agent: str,
+        status: str,
+        payload: str,
+    ) -> None:
+        """Fan out a single orchestrator event to all subscribers."""
+        event = OrchEvent(
+            run_id=run_id,
+            type=agent,
+            status=status,
+            payload=payload.encode("utf-8"),
+            ts=int(time.time()),
+        )
+        await self._orch_event_bus.publish(event)
+
+    def _publish_orch_event_sync(
+        self,
+        run_id: int,
+        agent: str,
+        status: str,
+        payload: str,
+    ) -> None:
+        """Publish an OrchEvent from sync RPC handlers."""
+        try:
+            loop = self._get_event_loop()
+            coro = self._publish_orch_event(run_id, agent, status, payload)
+            if loop.is_running():
+                self._schedule_coroutine(loop, coro)
+            else:
+                loop.run_until_complete(coro)
+        except RuntimeError:
+            return
+
+    async def _run_orc_orchestration(self, run_id: int, prompt: str) -> AsyncIterator[str]:
+        """Run ORC->ARC->CRT discussion and stream ORC final response.
+
+        HUB-VIEW receives only ARC/CRT planning-review events; ORC output is
+        streamed back on the main chat channel via AgentStream responses.
+        """
+        if self._llm_provider is None:
+            yield prompt
+            return
+
+        model = self._llm_model
+        shared_ctx: dict[str, str] = {"user_task": prompt}
+
+        orc_result = await self._llm_provider.complete(
+            f"{ORC_PROMPT}\n\nUSER TASK:\n{prompt}",
+            model=model,
+        )
+        shared_ctx["orc_summary"] = orc_result.text.strip()
+
+        arc_result = await self._llm_provider.complete(
+            (
+                f"{ARC_PROMPT}\n\n"
+                f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
+                f"USER TASK:\n{shared_ctx['user_task']}"
+            ),
+            model=model,
+        )
+        shared_ctx["arc_plan"] = arc_result.text.strip()
+        await self._publish_orch_event(run_id, "ARC", "plan", shared_ctx["arc_plan"][:240])
+
+        crt_result = await self._llm_provider.complete(
+            (
+                f"{CRT_PROMPT}\n\n"
+                f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
+                f"ARC PLAN:\n{shared_ctx['arc_plan']}"
+            ),
+            model=model,
+        )
+        shared_ctx["crt_review"] = crt_result.text.strip()
+        await self._publish_orch_event(run_id, "CRT", "review", shared_ctx["crt_review"][:240])
+
+        if not shared_ctx["crt_review"].upper().startswith("APPROVED"):
+            arc_revise = await self._llm_provider.complete(
+                (
+                    f"{ARC_PROMPT}\n\n"
+                    f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
+                    f"CRT FEEDBACK:\n{shared_ctx['crt_review']}\n\n"
+                    "Revise the plan to address the critique."
+                ),
+                model=model,
+            )
+            shared_ctx["arc_plan"] = arc_revise.text.strip()
+            await self._publish_orch_event(run_id, "ARC", "revise", shared_ctx["arc_plan"][:240])
+
+            crt_result = await self._llm_provider.complete(
+                (
+                    f"{CRT_PROMPT}\n\n"
+                    f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
+                    f"ARC PLAN:\n{shared_ctx['arc_plan']}"
+                ),
+                model=model,
+            )
+            shared_ctx["crt_review"] = crt_result.text.strip()
+            await self._publish_orch_event(run_id, "CRT", "review", shared_ctx["crt_review"][:240])
+
+        final_prompt = (
+            "You are ORC. Using the shared context below, deliver the final response "
+            "for the user task.\n\n"
+            f"USER TASK:\n{shared_ctx['user_task']}\n\n"
+            f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
+            f"ARC PLAN:\n{shared_ctx['arc_plan']}\n\n"
+            f"CRT REVIEW:\n{shared_ctx['crt_review']}"
+        )
+        async for chunk in self._llm_provider.stream(final_prompt, model=model):
+            text = getattr(chunk, "text", "")
+            if text:
+                yield text
+            if getattr(chunk, "done", False):
+                break
 
     def CreateHub(
         self, request: CreateHubRequest, context: grpc.ServicerContext
@@ -190,6 +396,7 @@ class HubService(HubServiceServicer):
                 "state": "active",
             }
 
+        self._publish_orch_event_sync(0, "HUB", "create", hub_id)
         return CreateHubResponse(hub_id=hub_id, created_at=created_at)
 
     def TerminateHub(
@@ -339,6 +546,7 @@ class HubService(HubServiceServicer):
         self, request: HubStatusRequest, context: grpc.ServicerContext
     ) -> HubStatusResponse:
         """Get the current status of a hub."""
+        self._publish_orch_event_sync(0, "HUB", "status_check", request.hub_id)
         if self._has_storage():
             try:
                 loop = self._get_event_loop()
@@ -485,6 +693,7 @@ class HubService(HubServiceServicer):
         outbound_queue: asyncio.Queue = asyncio.Queue()
         registered_run_id: int | None = None
         registered_agent_id: str | None = None
+        registered_hub_id: str = ""
 
         async for msg in request_iterator:
             logger.debug(
@@ -499,11 +708,13 @@ class HubService(HubServiceServicer):
             if registered_run_id is None:
                 registered_run_id = msg.run_id
                 registered_agent_id = msg.agent_id
-                if msg.agent_id.startswith("hub:"):
-                    parts = msg.agent_id.split(":", 3)
-                    hub_id = parts[1] if len(parts) > 1 else ""
-                    agent_name = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
-                    logger.debug("AgentStream: decoded hub_id=%s agent_name=%s", hub_id, agent_name)
+                registered_hub_id, agent_name = self._decode_hub_agent(msg.agent_id)
+                if registered_hub_id:
+                    logger.debug(
+                        "AgentStream: decoded hub_id=%s agent_name=%s",
+                        registered_hub_id,
+                        agent_name,
+                    )
                 await self._stream_router.register_handler(
                     msg.run_id, msg.agent_id, outbound_queue
                 )
@@ -551,16 +762,57 @@ class HubService(HubServiceServicer):
                 )
                 return
 
-            # Route or echo payload
+            # Route payload
+            prompt_text = msg.payload.decode("utf-8", errors="replace")
+            hub_intent = self._hub_meta_intent(prompt_text)
+            if hub_intent is not None:
+                await self._publish_orch_event(
+                    msg.run_id,
+                    "HUB",
+                    "status_check",
+                    registered_hub_id or "",
+                )
+                status = await self._resolve_hub_status_for_stream(registered_hub_id)
+                if status is None:
+                    yield AgentMessage(
+                        run_id=msg.run_id,
+                        agent_id="HubStatus",
+                        payload=b"",
+                        seq=msg.seq + 1,
+                        done=True,
+                        err="nohub",
+                    )
+                    return
+
+                payload = self._render_hub_meta_payload(hub_intent, status)
+                response_msg = AgentMessage(
+                    run_id=msg.run_id,
+                    agent_id="HubStatus",
+                    payload=payload,
+                    seq=msg.seq + 1,
+                    done=False,
+                    err="",
+                )
+                await self._stream_router.broadcast(msg.run_id, response_msg)
+                yield response_msg
+                continue
+
+            await self._publish_orch_event(
+                msg.run_id,
+                "HUB",
+                "llm_route",
+                prompt_text,
+            )
+
             if self._llm_provider is not None:
                 try:
-                    prompt_text = msg.payload.decode("utf-8", errors="replace")
+                    await self._publish_orch_event(msg.run_id, "ORC", "start", prompt_text)
                     seq = msg.seq + 1
-                    async for chunk in self._llm_provider.stream(prompt_text, model=self._llm_model):
-                        chunk_bytes = chunk.text.encode("utf-8")
+                    async for chunk_text in self._run_orc_orchestration(msg.run_id, prompt_text):
+                        chunk_bytes = chunk_text.encode("utf-8")
                         response_msg = AgentMessage(
                             run_id=msg.run_id,
-                            agent_id="orchestrator",
+                            agent_id="ORC",
                             payload=chunk_bytes,
                             seq=seq,
                             done=False,
@@ -569,6 +821,7 @@ class HubService(HubServiceServicer):
                         await self._stream_router.broadcast(msg.run_id, response_msg)
                         yield response_msg
                         seq += 1
+                    await self._publish_orch_event(msg.run_id, "ORC", "done", "")
                 except Exception as exc:
                     logger.error("LLM stream error: %s", exc)
                     if registered_run_id is not None and registered_agent_id is not None:
@@ -577,7 +830,7 @@ class HubService(HubServiceServicer):
                         )
                     yield AgentMessage(
                         run_id=msg.run_id,
-                        agent_id="orchestrator",
+                        agent_id="ORC",
                         payload=b"",
                         seq=msg.seq + 1,
                         done=True,
@@ -585,17 +838,15 @@ class HubService(HubServiceServicer):
                     )
                     return
             else:
-                # Echo fallback
-                response_msg = AgentMessage(
+                yield AgentMessage(
                     run_id=msg.run_id,
-                    agent_id="orchestrator",
-                    payload=msg.payload,
+                    agent_id="ORC",
+                    payload=b"",
                     seq=msg.seq + 1,
-                    done=False,
-                    err="",
+                    done=True,
+                    err="No LLM provider configured for orchestration",
                 )
-                await self._stream_router.broadcast(msg.run_id, response_msg)
-                yield response_msg
+                return
 
         # Clean up registration if iterator exhausted without done=True
         if registered_run_id is not None and registered_agent_id is not None:
@@ -620,19 +871,27 @@ class HubService(HubServiceServicer):
         Yields:
             OrchEvent responses with acknowledgment.
         """
-        for event in request_iterator:
-            logger.debug(
-                "OrchestratorEvents: run_id=%d type=%s status=%s",
-                event.run_id,
-                event.type,
-                event.status,
-            )
+        queue = self._orch_event_bus.subscribe()
 
-            # Acknowledge the event
-            yield OrchEvent(
-                run_id=event.run_id,
-                type="ack",
-                status=event.status,
-                payload=b"",
-                ts=int(time.time()),
-            )
+        async def _drain_requests() -> None:
+            async for event in request_iterator:
+                logger.debug(
+                    "OrchestratorEvents inbound: run_id=%d type=%s status=%s",
+                    event.run_id,
+                    event.type,
+                    event.status,
+                )
+
+        reader = asyncio.create_task(_drain_requests())
+        try:
+            while True:
+                outbound = await queue.get()
+                yield outbound
+        finally:
+            self._orch_event_bus.unsubscribe(queue)
+            reader.cancel()
+
+    @property
+    def orch_event_bus(self) -> OrchEventBus:
+        """Expose injected OrchEventBus for DI identity checks."""
+        return self._orch_event_bus

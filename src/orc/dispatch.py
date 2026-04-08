@@ -11,6 +11,59 @@ from src.llm.provider import LLMProvider
 from src.orc.task_queue import TaskItem, TaskQueue
 
 
+def resolve_pre_llm_hub_intent(prompt_text: str) -> str | None:
+    """Resolve deterministic hub meta intents before generic LLM routing.
+
+    The resolver normalizes case/whitespace, strips a leading slash, then
+    applies ordered matching:
+
+    1) exact command aliases,
+    2) phrase-level matches with explicit ``hub`` context,
+    3) deterministic precedence ``status > report > location``.
+
+    Args:
+        prompt_text: Raw user-entered prompt text.
+
+    Returns:
+        One of ``"status"``, ``"report"``, ``"location"`` when matched,
+        otherwise ``None``.
+    """
+    normalized = prompt_text.strip().lower().lstrip("/")
+    normalized = " ".join(normalized.split())
+
+    # Exact-match rules (highest precedence)
+    if normalized in {"status", "hub status", "hub-state", "hub state"}:
+        return "status"
+    if normalized in {"report", "hub-report", "hub report"}:
+        return "report"
+    if normalized in {
+        "location",
+        "hub-location",
+        "hub location",
+        "hub-id",
+        "hub id",
+        "hub_id",
+        "id",
+    }:
+        return "location"
+
+    # Phrase-match rules (deterministic precedence: status > report > location)
+    if "hub" in normalized:
+        if "status" in normalized:
+            return "status"
+        if "report" in normalized:
+            return "report"
+        if (
+            "location" in normalized
+            or "hub id" in normalized
+            or "hub-id" in normalized
+            or "hub_id" in normalized
+        ):
+            return "location"
+
+    return None
+
+
 class OrcDispatchError(Exception):
     """Raised when orc dispatch cannot complete a run request."""
 
@@ -208,4 +261,9 @@ async def dispatch_agent_stream(
     return msg
 
 
-__all__ = ["OrcDispatch", "OrcDispatchError", "dispatch_agent_stream"]
+__all__ = [
+    "OrcDispatch",
+    "OrcDispatchError",
+    "dispatch_agent_stream",
+    "resolve_pre_llm_hub_intent",
+]
