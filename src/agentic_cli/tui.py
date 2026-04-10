@@ -251,7 +251,10 @@ class MeridianApp(App):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.hub_event_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue(maxsize=200)
+        # Persistent log — survives screen changes, replayed on every HUB-VIEW open.
+        self.hub_event_log: deque[tuple[str, str, str]] = deque(maxlen=500)
+        # Per-subscriber live queues — each open HubViewScreen gets its own.
+        self._hub_subscribers: set[asyncio.Queue[tuple[str, str, str]]] = set()
         self._orc_event_listener_task: asyncio.Task[None] | None = None
         self._orc_event_client = GrpcHubClient()
 
@@ -262,18 +265,27 @@ class MeridianApp(App):
         self._start_orc_event_listener()
         self.push_screen(SplashMenuScreen())
 
-    def _enqueue_hub_event_with_drop_oldest(self, event: tuple[str, str, str]) -> None:
-        """Append event to bounded queue; drop oldest on overflow."""
-        if self.hub_event_queue.full():
-            try:
-                self.hub_event_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-        self.hub_event_queue.put_nowait(event)
-
     def publish_hub_event(self, agent: str, status: str, payload: str) -> None:
-        """Publish a HUB-VIEW frame on the app queue."""
-        self._enqueue_hub_event_with_drop_oldest((agent, status, payload))
+        """Append event to persistent log and fan out to all live HUB-VIEW subscribers."""
+        event = (agent, status, payload)
+        self.hub_event_log.append(event)
+        for q in list(self._hub_subscribers):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(event)
+
+    def subscribe_hub_events(self) -> asyncio.Queue[tuple[str, str, str]]:
+        """Create and register a per-subscriber live queue."""
+        q: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue(maxsize=200)
+        self._hub_subscribers.add(q)
+        return q
+
+    def unsubscribe_hub_events(self, q: asyncio.Queue[tuple[str, str, str]]) -> None:
+        """Remove a subscriber queue."""
+        self._hub_subscribers.discard(q)
 
     def _start_orc_event_listener(self) -> None:
         """Start global ORC event listener once for app lifetime."""
@@ -794,7 +806,10 @@ class OrcChatScreen(Screen):
 class HubViewScreen(Screen):
     """Live OrchestratorEvents stream viewer."""
 
-    BINDINGS = [("escape", "pop_screen", "Back")]
+    BINDINGS = [
+        ("escape", "pop_screen", "Back"),
+        ("ctrl+shift+c", "copy_log", "Copy all"),
+    ]
 
     DEFAULT_CSS = """
     HubViewScreen {
@@ -833,17 +848,15 @@ class HubViewScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Label("HUB VIEW — ESC to exit", id="hub-view-header")
         yield RichLog(id="hub-event-log", auto_scroll=True, markup=True, highlight=False, wrap=True)
-        yield Label("Ctrl+C: quit | ESC: back", id="hub-view-footer")
+        yield Label("ESC: back | Ctrl+Shift+C: copy all", id="hub-view-footer")
 
     _received_event: bool = False
     _render_seq: int = 0
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._replay_ring: deque[str] = deque(maxlen=50)
+    _plain_lines: list[str] = []
 
     async def on_mount(self) -> None:
-        """Start streaming worker; show placeholder after 3 seconds if quiet."""
+        self._plain_lines = []
+        """Start streaming worker; show placeholder after 3 seconds if no history."""
         self.run_worker(self._stream_events, exclusive=True)
         self.set_timer(3.0, self._maybe_show_placeholder)
 
@@ -858,42 +871,78 @@ class HubViewScreen(Screen):
         log.write("[dim]Waiting for agent events — send a message in chat[/dim]")
 
     async def _stream_events(self) -> None:
-        """Read from app-level hub_event_queue and display events."""
+        """Replay history then stream live events from the app-level log."""
         try:
             log = self.query_one("#hub-event-log", RichLog)
         except Exception:
             return
-        queue: asyncio.Queue = getattr(self.app, "hub_event_queue", None)
-        if queue is None:
-            log.write("[dim]No event queue available[/dim]")
-            return
-        while True:
-            try:
-                agent_code, status, payload = await asyncio.wait_for(queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                return
-            self._received_event = True
-            self._render_seq += 1
-            color = self.AGENT_COLORS.get(agent_code.upper(), "white")
-            status_part = f" [{status}]" if status else ""
-            rendered = f"[dim]{self._render_seq:03d}[/dim] [{color}]{agent_code}[/{color}]{status_part} > {payload}"
-            self._record_replay_line(rendered)
-            log.write(rendered)
 
-    def _record_replay_line(self, line: str) -> None:
-        """Track the latest rendered lines in a local replay ring."""
-        self._replay_ring.append(line)
+        # Subscribe and snapshot with no await in between — asyncio is
+        # single-threaded so no event can slip between these two lines.
+        live_queue = self.app.subscribe_hub_events()
+        snapshot = list(self.app.hub_event_log)
 
-    def _replay_lines(self) -> list[str]:
-        """Return local replay lines in FIFO order."""
-        return list(self._replay_ring)
+        try:
+            # Replay all historical events.
+            for idx, (agent_code, status, payload) in enumerate(snapshot):
+                self._write_event(log, idx + 1, agent_code, status, payload)
+            if snapshot:
+                self._received_event = True
+                log.write("[dim]--- replayed history ---[/dim]")
+
+            seq = len(snapshot)
+
+            # Stream live events.
+            while True:
+                try:
+                    agent_code, status, payload = await asyncio.wait_for(
+                        live_queue.get(), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return
+                seq += 1
+                self._received_event = True
+                self._write_event(log, seq, agent_code, status, payload)
+        finally:
+            self.app.unsubscribe_hub_events(live_queue)
+
+    def _write_event(self, log: RichLog, seq: int, agent_code: str, status: str, payload: str) -> None:
+        color = self.AGENT_COLORS.get(agent_code.upper(), "white")
+        status_part = f" [{status}]" if status else ""
+        log.write(f"[dim]{seq:03d}[/dim] [{color}]{agent_code}[/{color}]{status_part} > {payload}")
+        self._plain_lines.append(f"{seq:03d} {agent_code}{status_part} > {payload}")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_copy_log(self) -> None:
+        """Copy all HUB-VIEW text to clipboard."""
+        text = "\n".join(self._plain_lines)
+        if not text:
+            return
+        try:
+            self.app.copy_to_clipboard(text)
+            try:
+                footer = self.query_one("#hub-view-footer", Label)
+                footer.update("Copied to clipboard!")
+                self.set_timer(2.0, lambda: footer.update("ESC: back | Ctrl+Shift+C: copy all"))
+            except Exception:
+                pass
+        except Exception:
+            # Clipboard unavailable — write to a temp file as fallback.
+            import tempfile, pathlib
+            tmp = pathlib.Path(tempfile.mktemp(suffix=".txt", prefix="hubview-"))
+            tmp.write_text(text)
+            try:
+                footer = self.query_one("#hub-view-footer", Label)
+                footer.update(f"Clipboard unavailable — saved to {tmp}")
+                self.set_timer(4.0, lambda: footer.update("ESC: back | Ctrl+Shift+C: copy all"))
+            except Exception:
+                pass
 
 
 # ─── Provider Connect Screen ──────────────────────────────────────────────────
