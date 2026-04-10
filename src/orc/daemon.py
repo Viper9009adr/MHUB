@@ -34,7 +34,7 @@ DATABASE_URL_DEFAULT = "postgresql://postgres:postgres@localhost:5432/meridian"
 DB_POOL_SIZE_DEFAULT = 5
 REDIS_URL_DEFAULT = "redis://localhost:6379/0"
 GRACEFUL_SHUTDOWN_TIMEOUT = 30.0
-GRPC_GRACE_PERIOD = 5
+GRPC_GRACE_PERIOD = 0
 
 
 def _env_bool(key: str, default: bool = False) -> bool:

@@ -38,5 +38,5 @@ artifacts/
 .idea/
 .vscode/
 
-
+# Others
 .mcp.json

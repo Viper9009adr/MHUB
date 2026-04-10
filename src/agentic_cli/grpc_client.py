@@ -78,7 +78,8 @@ class GrpcHubClient:
         """
         stub = self._ensure_channel()
         response = await stub.CreateHub(
-            CreateHubRequest(workspace_id=workspace_id, initiator=initiator)
+            CreateHubRequest(workspace_id=workspace_id, initiator=initiator),
+            timeout=5.0,
         )
         logger.debug("create_hub: hub_id=%s", response.hub_id)
         return response.hub_id
@@ -148,10 +149,10 @@ class GrpcHubClient:
         """
         stub = self._ensure_channel()
         try:
-            response = await stub.HubStatus(HubStatusRequest(hub_id=hub_id))
+            response = await stub.HubStatus(HubStatusRequest(hub_id=hub_id), timeout=5.0)
             logger.debug("hub_status: hub_id=%s state=%s", hub_id, response.state)
             return response.state
-        except grpc.aio.AioRpcError as exc:
+        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as exc:
             logger.warning("hub_status gRPC error: %s", exc)
             return "unknown"
 

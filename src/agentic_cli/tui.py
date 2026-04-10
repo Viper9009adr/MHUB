@@ -282,14 +282,25 @@ class MeridianApp(App):
         self._orc_event_listener_task = asyncio.create_task(self._listen_orc_events())
 
     async def _listen_orc_events(self) -> None:
-        """Forward live orchestrator events from gRPC into app queue."""
-        try:
-            async for agent, status, payload in self._orc_event_client.listen_orc_events():
-                self.publish_hub_event(agent, status, payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.publish_hub_event("ERR", "", str(exc))
+        """Forward live orchestrator events from gRPC into app queue, with reconnect."""
+        backoff = 2.0
+        while True:
+            try:
+                # Re-create the client each attempt so the channel is fresh.
+                self._orc_event_client = GrpcHubClient()
+                async for agent, status, payload in self._orc_event_client.listen_orc_events():
+                    backoff = 2.0  # reset on successful receive
+                    self.publish_hub_event(agent, status, payload)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+            # Brief pause before reconnecting; cap at 30 s.
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                return
+            backoff = min(backoff * 2, 30.0)
 
     async def on_shutdown(self) -> None:
         """Cancel global listener and close client on app shutdown."""
@@ -689,8 +700,6 @@ class OrcChatScreen(Screen):
             loading = self.query_one("#loading-indicator", LoadingIndicator)
             if self._hub_id is None:
                 await self._init_hub()
-            if self._hub_id is None:
-                raise RuntimeError("Unable to create hub; orchestration requires active hub")
 
             self._run_counter += 1
             run_id = self._run_counter
@@ -702,15 +711,27 @@ class OrcChatScreen(Screen):
                     # Hub-specific command (status, report, location)
                     self._publish_hub_view_event("HUB", hub_intent, self._hub_id or "")
                     accumulated.append(f"Hub {hub_intent}: {self._hub_id or 'no hub'}")
-                else:
-                    # Normal prompt - send to LLM
-                    self._publish_hub_view_event("HUB", "llm_stream", self._hub_id or "")
+                elif self._hub_id is not None:
+                    # Hub available — stream via gRPC
+                    self._publish_hub_view_event("HUB", "llm_stream", self._hub_id)
                     async for chunk_text in self._grpc_client.stream_prompt(
                         hub_id=self._hub_id,
                         run_id=run_id,
                         prompt=prompt_text,
                     ):
                         accumulated.append(chunk_text)
+                else:
+                    # Hub unavailable — fall back to direct LLM
+                    if self._llm_provider is None:
+                        from src.llm.factory import create_provider
+                        provider_name = os.environ.get("LLM_PROVIDER", self._config.llm_provider)
+                        self._llm_provider = create_provider(provider_name)
+                    llm_model = os.environ.get("LLM_MODEL", self._config.llm_model)
+                    command = RunCommand(prompt=prompt_text, session_id=self._current_session_id)
+                    async for chunk in self._service.async_stream_with_llm(
+                        command, self._llm_provider, llm_model=llm_model
+                    ):
+                        accumulated.append(chunk)
             finally:
                 loading.display = False
             full_output = "".join(accumulated)

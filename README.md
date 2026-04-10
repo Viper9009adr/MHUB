@@ -23,6 +23,17 @@ What is implemented now:
 - `src/api/routes/run.py` — FastAPI router factory (`create_run_router`) for the `/api/v1/run` endpoint
 - `src/api/schemas/run.py` — Pydantic request/response schemas (`RunRequest`, `RunResponse`, `HealthResponse`, `ErrorResponse`)
 
+### Runtime contract and naming-convention files
+
+The current runtime contract surface is documented/implemented across:
+
+- `docs/runtime_contract_matrix.md`
+- `runtime/message_bus.py`
+- `runtime/worker_runner.py`
+- `runtime/cli_runtime.py`
+
+These files use `Req` / `Evt` / `RunResult` naming consistently for request envelope, event frame, and final result.
+
 What is not implemented in this slice:
 - no Redis backend
 - no remote agent execution beyond the deterministic local formatter in `AgenticCliService`
@@ -68,6 +79,12 @@ The pycore3 slice adds a gRPC transport layer, a PostgreSQL storage backend, and
 - Reusing a session id increments `turn_index` for that session
 - The local backend returns deterministic output in the form `local:<turn_index>:<prompt>`
 - Successful CLI output is emitted as one line: `session_id=... turn_index=... backend=... output=...`
+
+### Hub prompt routing behavior (implemented)
+
+- Recognized hub meta commands remain explicit via `resolve_pre_llm_hub_intent()` in `src/orc/dispatch.py` (`status`, `report`, `location` aliases and hub-context phrase matches).
+- In `HubService.AgentStream` (`src/hub/service.py`), those recognized intents bypass LLM orchestration and return deterministic `HubStatus` payloads.
+- Free-form prompts that do not match hub meta intent route to the orchestrator path (`ORC` events + `_run_orc_orchestration` stream when an LLM provider is configured).
 
 `replay-sla` is still available, but it is separate from the new `run` path.
 
@@ -543,12 +560,10 @@ Configuration table above) is the end-to-end source of the model identifier.
 
 ### Validation
 
-Current Python validation baseline for this branch is:
-- `179` tests discovered
-- `179` tests passed
-- `0` failed
-- `0` errored
-- validation run and reported by **TST**
+Current known validation status:
+- `tests/integration/test_grpc_hub.py` (`3` failing)
+- compile verification pending `python3 -m py_compile` requirement
+- status reporting source: **TST** output as relayed in Meridian context
 
 ### Repository hygiene: ignore rules and sensitive-data scan behavior
 

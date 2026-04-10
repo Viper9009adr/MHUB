@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import time
@@ -13,6 +12,7 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import grpc
+import grpc.aio
 
 from src.hub.hub_pb2 import (
     CreateHubRequest,
@@ -86,6 +86,65 @@ class OrchEventBus:
         self._subscribers.discard(queue)
 
 
+class OrchEventStream:
+    """Async iterator wrapper that supports concurrent __anext__ calls."""
+
+    def __init__(
+        self,
+        bus: OrchEventBus,
+        request_iterator: AsyncIterator[OrchEvent] | Iterator[OrchEvent],
+    ) -> None:
+        self._bus = bus
+        self._request_iterator = request_iterator
+        self._queue = bus.subscribe()
+        self._closed = False
+        self._next_lock = asyncio.Lock()
+        self._reader = asyncio.create_task(self._drain_requests())
+
+    async def _drain_requests(self) -> None:
+        try:
+            if hasattr(self._request_iterator, "__aiter__"):
+                async for event in self._request_iterator:
+                    logger.debug(
+                        "OrchestratorEvents inbound: run_id=%d type=%s status=%s",
+                        event.run_id,
+                        event.type,
+                        event.status,
+                    )
+            else:
+                for event in self._request_iterator:
+                    logger.debug(
+                        "OrchestratorEvents inbound: run_id=%d type=%s status=%s",
+                        event.run_id,
+                        event.type,
+                        event.status,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("OrchestratorEvents inbound stream closed: %s", exc)
+
+    def __aiter__(self) -> OrchEventStream:
+        return self
+
+    async def __anext__(self) -> OrchEvent:
+        async with self._next_lock:
+            if self._closed:
+                raise StopAsyncIteration
+            return await self._queue.get()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._bus.unsubscribe(self._queue)
+        self._reader.cancel()
+        try:
+            await self._reader
+        except asyncio.CancelledError:
+            pass
+
+
 class HubService(HubServiceServicer):
     """Concrete implementation of the HubService gRPC servicer.
 
@@ -152,17 +211,15 @@ class HubService(HubServiceServicer):
     def _schedule_coroutine(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
         """Schedule a coroutine safely from a synchronous context.
 
-        Distinguishes two cases:
-        - Same thread as the loop (e.g., pytest-asyncio, grpc.aio): run the
-          coroutine in a background thread with its own event loop via
-          asyncio.run(). Cannot use ensure_future (fire-and-forget) because
-          the caller's next await may not yield the loop before reading the
-          result, leaving the task unexecuted. Cannot block the current thread
-          directly (would deadlock the running loop). ThreadPoolExecutor +
-          asyncio.run() gives us synchronous completion without deadlock.
-        - Different thread from loop (e.g., production gRPC worker threads):
-          use run_coroutine_threadsafe + future.result() which is safe because
-          blocking the worker thread does NOT block the loop thread.
+        Uses fire-and-forget in all cases to avoid blocking the event loop.
+        Blocking the running loop (e.g. via ThreadPoolExecutor.result()) while
+        inside a sync gRPC handler prevents the response from being sent and
+        causes client-side DEADLINE_EXCEEDED at the timeout boundary.
+
+        - Same thread as the loop (grpc.aio calls sync handlers on the loop):
+          use ensure_future — schedules the coroutine as a task without blocking.
+        - Different thread (worker thread outside the loop):
+          use run_coroutine_threadsafe — schedules without blocking this thread.
         """
         try:
             running_loop = asyncio.get_running_loop()
@@ -170,26 +227,11 @@ class HubService(HubServiceServicer):
             running_loop = None
 
         if running_loop is loop:
-            # Same thread as the running loop — spin up a background thread
-            # with its own event loop so the coroutine completes synchronously
-            # without touching the caller's running loop.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                bg_future = ex.submit(asyncio.run, coro)
-                try:
-                    bg_future.result(timeout=5)
-                except concurrent.futures.TimeoutError:
-                    logger.error("storage op timed out (same-thread path)")
-                except Exception as e:
-                    logger.error("storage op failed (same-thread path): %s", e)
+            # Same thread — schedule as a task; do NOT block the event loop.
+            asyncio.ensure_future(coro, loop=loop)
         else:
-            # Different thread — safe to block the current thread.
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-            try:
-                future.result(timeout=5)
-            except concurrent.futures.TimeoutError:
-                logger.error("storage op timed out")
-            except Exception as e:
-                logger.error("storage op failed: %s", e)
+            # Different thread — schedule on the loop from this thread.
+            asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _decode_hub_agent(self, agent_id: str) -> tuple[str, str]:
         """Decode `hub:<hub_id>:...:<agent_name>` style agent_id."""
@@ -226,10 +268,18 @@ class HubService(HubServiceServicer):
             updated_at=hub["created_at"],
         )
 
-    def _render_hub_meta_payload(self, intent: str, status: HubStatusResponse) -> bytes:
+    def _render_hub_meta_payload(
+        self,
+        intent: str,
+        status: HubStatusResponse,
+        prompt_text: str,
+    ) -> bytes:
         """Render deterministic payload for hub-state/report/location intents."""
         if intent == "location":
             return status.hub_id.encode("utf-8")
+        normalized = " ".join(prompt_text.strip().lower().lstrip("/").split())
+        if intent == "status" and normalized in {"hub-state", "hub state"}:
+            return status.state.encode("utf-8")
         return json.dumps(
             {
                 "id": status.hub_id,
@@ -718,6 +768,7 @@ class HubService(HubServiceServicer):
                 await self._stream_router.register_handler(
                     msg.run_id, msg.agent_id, outbound_queue
                 )
+                await asyncio.sleep(0)
 
             # Handle error messages
             if msg.err:
@@ -780,11 +831,11 @@ class HubService(HubServiceServicer):
                         payload=b"",
                         seq=msg.seq + 1,
                         done=True,
-                        err="nohub",
+                        err="no-hub",
                     )
                     return
 
-                payload = self._render_hub_meta_payload(hub_intent, status)
+                payload = self._render_hub_meta_payload(hub_intent, status, prompt_text)
                 response_msg = AgentMessage(
                     run_id=msg.run_id,
                     agent_id="HubStatus",
@@ -797,16 +848,10 @@ class HubService(HubServiceServicer):
                 yield response_msg
                 continue
 
-            await self._publish_orch_event(
-                msg.run_id,
-                "HUB",
-                "llm_route",
-                prompt_text,
-            )
-
             if self._llm_provider is not None:
                 try:
-                    await self._publish_orch_event(msg.run_id, "ORC", "start", prompt_text)
+                    await self._publish_orch_event(msg.run_id, "ORC", "recv", prompt_text)
+                    await self._publish_orch_event(msg.run_id, "ORC", "scope", "orchestrate")
                     seq = msg.seq + 1
                     async for chunk_text in self._run_orc_orchestration(msg.run_id, prompt_text):
                         chunk_bytes = chunk_text.encode("utf-8")
@@ -821,7 +866,7 @@ class HubService(HubServiceServicer):
                         await self._stream_router.broadcast(msg.run_id, response_msg)
                         yield response_msg
                         seq += 1
-                    await self._publish_orch_event(msg.run_id, "ORC", "done", "")
+                    await self._publish_orch_event(msg.run_id, "ORC", "final", "")
                 except Exception as exc:
                     logger.error("LLM stream error: %s", exc)
                     if registered_run_id is not None and registered_agent_id is not None:
@@ -856,40 +901,49 @@ class HubService(HubServiceServicer):
 
     async def OrchestratorEvents(
         self,
-        request_iterator: Iterator[OrchEvent],
-        context: grpc.ServicerContext,
-    ) -> Iterator[OrchEvent]:
+        request_iterator: AsyncIterator[OrchEvent],
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[OrchEvent]:
         """Bidirectional streaming for orchestrator events.
 
         Orchestrator sends OrchEvent with run_id, type, status, payload, ts.
         Used for real-time run status updates between orchestrator and agents.
 
         Args:
-            request_iterator: Stream of OrchEvent from the client.
-            context: gRPC servicer context.
+            request_iterator: Async stream of OrchEvent from the client.
+            context: gRPC async servicer context.
 
         Yields:
-            OrchEvent responses with acknowledgment.
+            OrchEvent frames published to the internal event bus.
         """
-        queue = self._orch_event_bus.subscribe()
+        queue: asyncio.Queue[OrchEvent] = self._orch_event_bus.subscribe()
+        # Drain client subscribe frames in background so the client send-side
+        # stays alive (keeps the bidirectional stream open).
+        async def _drain() -> None:
+            try:
+                async for event in request_iterator:
+                    logger.debug(
+                        "OrchestratorEvents inbound: type=%s status=%s",
+                        event.type,
+                        event.status,
+                    )
+            except Exception as exc:
+                logger.debug("OrchestratorEvents inbound closed: %s", exc)
 
-        async def _drain_requests() -> None:
-            async for event in request_iterator:
-                logger.debug(
-                    "OrchestratorEvents inbound: run_id=%d type=%s status=%s",
-                    event.run_id,
-                    event.type,
-                    event.status,
-                )
-
-        reader = asyncio.create_task(_drain_requests())
+        drain_task = asyncio.create_task(_drain())
         try:
             while True:
-                outbound = await queue.get()
-                yield outbound
+                event = await queue.get()
+                yield event
+        except asyncio.CancelledError:
+            pass
         finally:
+            drain_task.cancel()
+            try:
+                await drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._orch_event_bus.unsubscribe(queue)
-            reader.cancel()
 
     @property
     def orch_event_bus(self) -> OrchEventBus:

@@ -104,16 +104,38 @@ echo ""
 echo "Starting Meridian HUB..."
 echo "  API:  http://localhost:${API_PORT}"
 echo "  gRPC: localhost:${GRPC_PORT}"
+echo "  PID file: ${PROJECT_ROOT}/.meridian.pid"
+echo "  Stop with: bash scripts/stop.sh  OR  kill \$(cat .meridian.pid)"
 echo ""
 
 # Export config for the app
 export API_PORT
 export MERIDIAN_GRPC_PORT="${GRPC_PORT}"
 
-# Start the API server
+PID_FILE="${PROJECT_ROOT}/.meridian.pid"
+
+cleanup() {
+  echo ""
+  echo "Shutting down Meridian HUB..."
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "Done."
+  exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# Start the API server in the background so the trap can catch signals
 cd "${PROJECT_ROOT}"
 PYTHONPATH="${PROJECT_ROOT}" uvicorn src.api.app:create_app \
   --host 0.0.0.0 \
   --port "${API_PORT}" \
   --factory \
-  --reload 2>&1
+  --reload 2>&1 &
+SERVER_PID=$!
+echo "$SERVER_PID" > "$PID_FILE"
+
+wait "$SERVER_PID"
+rm -f "$PID_FILE"
