@@ -45,14 +45,21 @@ from src.orc.dispatch import resolve_pre_llm_hub_intent
 logger = logging.getLogger(__name__)
 
 ORC_PROMPT = (
-    "You are ORC. Restate the user task in 1-2 sentences and define the final answer shape."
+    "You are ORC, the Orchestrator. Given the user task, restate it precisely in 1-2 "
+    "sentences and define the expected output shape (e.g., code, plan, analysis, answer). "
+    "Be specific about constraints, success criteria, and scope boundaries."
 )
 ARC_PROMPT = (
-    "You are ARC. Produce a concise execution plan in 3-5 bullets for the task."
+    "You are ARC, the Architect. Produce a detailed execution plan with 4-6 numbered steps. "
+    "For each step specify: what is done, why it is needed, and what the output is. "
+    "Anticipate edge cases. Be concrete — avoid vague directives like 'handle errors'."
 )
 CRT_PROMPT = (
-    "You are CRT. Review ARC's plan with ORC context. Reply with APPROVED or "
-    "REJECTED: <reason>, then one short rationale."
+    "You are CRT, the Critic. Scrutinize ARC's plan against the ORC context. "
+    "Your response MUST begin with exactly APPROVED or REJECTED (all caps, first word). "
+    "Then provide specific critique: identify gaps, ambiguities, missing edge cases, or "
+    "incorrect assumptions. If APPROVED, still note one improvement for next time. "
+    "If REJECTED, list exactly what ARC must fix in the revision."
 )
 
 
@@ -167,6 +174,7 @@ class HubService(HubServiceServicer):
         llm_provider: Any = None,
         llm_model: str = "",
         orch_event_bus: OrchEventBus | None = None,
+        debate_rounds: int = 3,
     ) -> None:
         """Initialise HubService.
 
@@ -185,6 +193,7 @@ class HubService(HubServiceServicer):
         self._llm_provider = llm_provider
         self._llm_model = llm_model
         self._orch_event_bus = orch_event_bus or OrchEventBus()
+        self._debate_rounds = max(1, debate_rounds)
         self._stream_router = StreamRouter()
         self._hubs: dict[str, dict[str, Any]] = {}
         self._events: dict[str, list[JoinHubEvent]] = defaultdict(list)
@@ -328,79 +337,104 @@ class HubService(HubServiceServicer):
             return
 
     async def _run_orc_orchestration(self, run_id: int, prompt: str) -> AsyncIterator[str]:
-        """Run ORC->ARC->CRT discussion and stream ORC final response.
+        """Run ORC->ARC->CRT debate loop and stream ORC final response.
 
-        HUB-VIEW receives only ARC/CRT planning-review events; ORC output is
-        streamed back on the main chat channel via AgentStream responses.
+        Each agent (ORC, ARC, CRT) maintains its own independent conversation
+        history (message list). This means:
+        - ARC in round 3 remembers its own plans from rounds 1 and 2
+        - CRT in round 3 remembers its own critiques from rounds 1 and 2
+        - Cross-agent communication is explicit: each agent receives the other's
+          last output as a new user turn in its own history
+
+        The loop exits early when CRT's response starts with APPROVED, or after
+        self._debate_rounds rounds.
         """
         if self._llm_provider is None:
             yield prompt
             return
 
         model = self._llm_model
-        shared_ctx: dict[str, str] = {"user_task": prompt}
 
-        orc_result = await self._llm_provider.complete(
-            f"{ORC_PROMPT}\n\nUSER TASK:\n{prompt}",
-            model=model,
-        )
-        shared_ctx["orc_summary"] = orc_result.text.strip()
+        # Each agent owns its own message history — completely isolated context windows
+        orc_msgs: list[dict] = [{"role": "system", "content": ORC_PROMPT}]
+        arc_msgs: list[dict] = [{"role": "system", "content": ARC_PROMPT}]
+        crt_msgs: list[dict] = [{"role": "system", "content": CRT_PROMPT}]
 
-        arc_result = await self._llm_provider.complete(
-            (
-                f"{ARC_PROMPT}\n\n"
-                f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
-                f"USER TASK:\n{shared_ctx['user_task']}"
+        # --- ORC: frame the task ---
+        orc_msgs.append({"role": "user", "content": f"USER TASK:\n{prompt}"})
+        orc_result = await self._llm_provider.complete("", model=model, messages=orc_msgs)
+        orc_summary = orc_result.text.strip()
+        orc_msgs.append({"role": "assistant", "content": orc_summary})
+        await self._publish_orch_event(run_id, "ORC", "frame", orc_summary)
+
+        # --- ARC: initial plan ---
+        arc_msgs.append({
+            "role": "user",
+            "content": f"USER TASK:\n{prompt}\n\nORC CONTEXT:\n{orc_summary}",
+        })
+        arc_result = await self._llm_provider.complete("", model=model, messages=arc_msgs)
+        arc_plan = arc_result.text.strip()
+        arc_msgs.append({"role": "assistant", "content": arc_plan})
+        await self._publish_orch_event(run_id, "ARC", "plan", arc_plan)
+
+        # --- CRT: initial review context ---
+        crt_msgs.append({
+            "role": "user",
+            "content": (
+                f"USER TASK:\n{prompt}\n\n"
+                f"ORC CONTEXT:\n{orc_summary}\n\n"
+                f"This is round 1 of {self._debate_rounds}. Review ARC's plan below."
             ),
-            model=model,
-        )
-        shared_ctx["arc_plan"] = arc_result.text.strip()
-        await self._publish_orch_event(run_id, "ARC", "plan", shared_ctx["arc_plan"][:240])
+        })
 
-        crt_result = await self._llm_provider.complete(
-            (
-                f"{CRT_PROMPT}\n\n"
-                f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
-                f"ARC PLAN:\n{shared_ctx['arc_plan']}"
+        # --- Debate loop ---
+        approved = False
+        crt_review = ""
+        for round_num in range(1, self._debate_rounds + 1):
+            # CRT reviews the current ARC plan
+            crt_msgs.append({"role": "user", "content": f"ARC PLAN (round {round_num}):\n{arc_plan}"})
+            crt_result = await self._llm_provider.complete("", model=model, messages=crt_msgs)
+            crt_review = crt_result.text.strip()
+            crt_msgs.append({"role": "assistant", "content": crt_review})
+            await self._publish_orch_event(run_id, "CRT", f"review-r{round_num}", crt_review)
+
+            if crt_review.upper().startswith("APPROVED"):
+                approved = True
+                break
+
+            # ARC revises based on CRT feedback (if rounds remain)
+            if round_num < self._debate_rounds:
+                arc_msgs.append({
+                    "role": "user",
+                    "content": (
+                        f"CRT FEEDBACK (round {round_num}):\n{crt_review}\n\n"
+                        "Revise your plan to fully address every point CRT raised. "
+                        "Do not repeat approaches that were rejected."
+                    ),
+                })
+                arc_result = await self._llm_provider.complete("", model=model, messages=arc_msgs)
+                arc_plan = arc_result.text.strip()
+                arc_msgs.append({"role": "assistant", "content": arc_plan})
+                await self._publish_orch_event(run_id, "ARC", f"revise-r{round_num}", arc_plan)
+
+        if not approved:
+            await self._publish_orch_event(
+                run_id, "ORC", "debate-end",
+                f"Max debate rounds ({self._debate_rounds}) reached without CRT approval. "
+                "Proceeding with best available plan.",
+            )
+
+        # --- ORC: final response, streamed with full debate context ---
+        orc_msgs.append({
+            "role": "user",
+            "content": (
+                f"The ARC↔CRT debate is complete ({'approved' if approved else 'max rounds reached'}).\n\n"
+                f"FINAL ARC PLAN:\n{arc_plan}\n\n"
+                f"CRT FINAL REVIEW:\n{crt_review}\n\n"
+                "Deliver the final response to the user. Be thorough and actionable."
             ),
-            model=model,
-        )
-        shared_ctx["crt_review"] = crt_result.text.strip()
-        await self._publish_orch_event(run_id, "CRT", "review", shared_ctx["crt_review"][:240])
-
-        if not shared_ctx["crt_review"].upper().startswith("APPROVED"):
-            arc_revise = await self._llm_provider.complete(
-                (
-                    f"{ARC_PROMPT}\n\n"
-                    f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
-                    f"CRT FEEDBACK:\n{shared_ctx['crt_review']}\n\n"
-                    "Revise the plan to address the critique."
-                ),
-                model=model,
-            )
-            shared_ctx["arc_plan"] = arc_revise.text.strip()
-            await self._publish_orch_event(run_id, "ARC", "revise", shared_ctx["arc_plan"][:240])
-
-            crt_result = await self._llm_provider.complete(
-                (
-                    f"{CRT_PROMPT}\n\n"
-                    f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
-                    f"ARC PLAN:\n{shared_ctx['arc_plan']}"
-                ),
-                model=model,
-            )
-            shared_ctx["crt_review"] = crt_result.text.strip()
-            await self._publish_orch_event(run_id, "CRT", "review", shared_ctx["crt_review"][:240])
-
-        final_prompt = (
-            "You are ORC. Using the shared context below, deliver the final response "
-            "for the user task.\n\n"
-            f"USER TASK:\n{shared_ctx['user_task']}\n\n"
-            f"ORC CONTEXT:\n{shared_ctx['orc_summary']}\n\n"
-            f"ARC PLAN:\n{shared_ctx['arc_plan']}\n\n"
-            f"CRT REVIEW:\n{shared_ctx['crt_review']}"
-        )
-        async for chunk in self._llm_provider.stream(final_prompt, model=model):
+        })
+        async for chunk in self._llm_provider.stream("", model=model, messages=orc_msgs):
             text = getattr(chunk, "text", "")
             if text:
                 yield text

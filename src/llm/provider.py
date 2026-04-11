@@ -11,12 +11,23 @@ from src.llm.models import LLMChunk, LLMResponse
 class LLMProvider(Protocol):
     """Protocol that all LLM provider implementations must satisfy."""
 
-    async def complete(self, prompt: str, model: str, **kwargs) -> LLMResponse:
+    async def complete(
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs,
+    ) -> LLMResponse:
         """Send a completion request and return the full response.
 
         Args:
-            prompt: The prompt text to send to the model.
+            prompt: The prompt text to send to the model. Ignored when
+                ``messages`` is provided.
             model: The model identifier (e.g. "gpt-4o", "claude-3-5-sonnet").
+            messages: Full chat history as a list of ``{"role", "content"}``
+                dicts. When provided, ``prompt`` is ignored and the messages
+                list is sent verbatim (after provider-specific normalisation).
             **kwargs: Provider-specific extra parameters (temperature, max_tokens, etc.).
 
         Returns:
@@ -27,12 +38,21 @@ class LLMProvider(Protocol):
         """
         ...
 
-    async def stream(self, prompt: str, model: str, **kwargs) -> AsyncGenerator[LLMChunk, None]:
+    async def stream(
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs,
+    ) -> AsyncGenerator[LLMChunk, None]:
         """Stream a completion response chunk by chunk.
 
         Args:
-            prompt: The prompt text to send to the model.
+            prompt: The prompt text to send to the model. Ignored when
+                ``messages`` is provided.
             model: The model identifier.
+            messages: Full chat history. When provided, ``prompt`` is ignored.
             **kwargs: Provider-specific extra parameters.
 
         Yields:

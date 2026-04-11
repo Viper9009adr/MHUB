@@ -46,7 +46,12 @@ class NvidiaProvider:
 
     @with_llm_retry()
     async def complete(
-        self, prompt: str, model: str, **kwargs: Any
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Send a completion request to Nvidia NIM."""
         headers = {
@@ -55,7 +60,7 @@ class NvidiaProvider:
         }
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages if messages is not None else [{"role": "user", "content": prompt}],
             "stream": False,
         }
         body.update(kwargs)
@@ -71,7 +76,12 @@ class NvidiaProvider:
             return self._handle_response(resp)
 
     async def stream(
-        self, prompt: str, model: str, **kwargs: Any
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs: Any,
     ) -> AsyncGenerator[LLMChunk, None]:
         """Stream a completion response from Nvidia NIM."""
         headers = {
@@ -81,7 +91,7 @@ class NvidiaProvider:
         }
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages if messages is not None else [{"role": "user", "content": prompt}],
             "stream": True,
         }
         body.update(kwargs)

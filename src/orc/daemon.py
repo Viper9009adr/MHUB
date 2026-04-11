@@ -75,9 +75,10 @@ class OrcDaemon:
         redis_url: str = REDIS_URL_DEFAULT,
         redis_enabled: bool = True,
         llm_provider: LLMProvider | None = None,
-        llm_model: str = "gpt-4o",
+        llm_model: str = "Claudito",
         grpc_grace_period: int = GRPC_GRACE_PERIOD,
         shutdown_timeout: float = GRACEFUL_SHUTDOWN_TIMEOUT,
+        debate_rounds: int = 3,
     ) -> None:
         self._grpc_port = grpc_port
         self._database_url = database_url
@@ -95,6 +96,7 @@ class OrcDaemon:
         self._llm_model = llm_model
         self._grpc_grace_period = grpc_grace_period
         self._shutdown_timeout = shutdown_timeout
+        self._debate_rounds = int(os.environ.get("MERIDIAN_DEBATE_ROUNDS", str(debate_rounds)))
         self._server: grpc.aio.Server | None = None
         self._storage: StorageBackend | NullStorageBackend | None = None
         self._hub_service: HubService | None = None
@@ -162,6 +164,7 @@ class OrcDaemon:
             fork_handler=self._fork_handler,
             llm_provider=self._llm_provider,
             llm_model=self._llm_model,
+            debate_rounds=self._debate_rounds,
         )
         self._server = grpc.aio.server()
         add_HubServiceServicer_to_server(self._hub_service, self._server)

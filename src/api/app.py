@@ -58,6 +58,7 @@ async def lifespan(
         llm_model=app.state.llm_model,
         redis_url=app.state.redis_url,
         redis_enabled=app.state.redis_enabled,
+        debate_rounds=app.state.debate_rounds,
     )
     await daemon.start()
     try:
@@ -77,6 +78,7 @@ def create_app(
     llm_api_key: str | None = None,
     redis_url: str | None = None,
     redis_enabled: bool | None = None,
+    debate_rounds: int = 3,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -117,6 +119,7 @@ def create_app(
     app.state.llm_api_key = llm_api_key
     app.state.redis_url = resolved_redis_url
     app.state.redis_enabled = resolved_redis_enabled
+    app.state.debate_rounds = debate_rounds
 
     orc = dispatch or OrcDispatch()
 

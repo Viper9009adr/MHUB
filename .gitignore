@@ -40,3 +40,4 @@ artifacts/
 
 # Others
 .mcp.json
+.meridian.pid

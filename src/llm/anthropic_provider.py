@@ -42,9 +42,32 @@ class AnthropicProvider:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
+    @staticmethod
+    def _build_anthropic_messages(
+        messages: list[dict],
+    ) -> tuple[str, list[dict]]:
+        """Split a standard messages list into Anthropic's (system, messages) format.
+
+        Anthropic does not accept role=system inside the messages array.
+        System turns are concatenated and returned as the top-level system string.
+        """
+        system_parts: list[str] = []
+        chat: list[dict] = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_parts.append(msg.get("content", ""))
+            else:
+                chat.append(msg)
+        return "\n\n".join(system_parts), chat
+
     @with_llm_retry()
     async def complete(
-        self, prompt: str, model: str, **kwargs: Any
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Send a completion request to Anthropic."""
         headers = {
@@ -52,11 +75,19 @@ class AnthropicProvider:
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
+        if messages is not None:
+            system_text, chat_messages = self._build_anthropic_messages(messages)
+        else:
+            system_text = ""
+            chat_messages = [{"role": "user", "content": prompt}]
+
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": chat_messages,
             "max_tokens": kwargs.pop("max_tokens", 4096),
         }
+        if system_text:
+            body["system"] = system_text
         body.update(kwargs)
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -70,7 +101,12 @@ class AnthropicProvider:
             return self._handle_response(resp)
 
     async def stream(
-        self, prompt: str, model: str, **kwargs: Any
+        self,
+        prompt: str,
+        model: str,
+        *,
+        messages: list[dict] | None = None,
+        **kwargs: Any,
     ) -> AsyncGenerator[LLMChunk, None]:
         """Stream a completion response from Anthropic."""
         headers = {
@@ -79,12 +115,20 @@ class AnthropicProvider:
             "content-type": "application/json",
             "accept": "text/event-stream",
         }
+        if messages is not None:
+            system_text, chat_messages = self._build_anthropic_messages(messages)
+        else:
+            system_text = ""
+            chat_messages = [{"role": "user", "content": prompt}]
+
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": chat_messages,
             "max_tokens": kwargs.pop("max_tokens", 4096),
             "stream": True,
         }
+        if system_text:
+            body["system"] = system_text
         body.update(kwargs)
 
         _last_exc: Exception | None = None
